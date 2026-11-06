@@ -1,0 +1,14 @@
+# Derleme çıktıları (çalıştırılabilir dosyalar repoya eklenmez)
+*.exe
+*.o
+*.obj
+*.res
+*.pdb
+*.ilk
+*.app/
+.build/
+.swiftpm/
+DerivedData/
+.vscode/
+.DS_Store
+Thumbs.db
