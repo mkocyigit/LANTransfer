@@ -57,9 +57,9 @@ static const size_t CHUNK = 1 << 20;
 enum {
     ID_PEERS = 100, ID_QUEUE, ID_IP, ID_ADDFILE, ID_ADDDIR, ID_REMOVE, ID_CLEAR,
     ID_SEND, ID_OPEN, ID_PROGRESS, ID_STATUS, ID_INFO, ID_LBL_PEERS, ID_LBL_QUEUE, ID_LBL_IP,
-    ID_SPEED, ID_AUTOSTART, ID_TRAY_SHOW = 300, ID_TRAY_EXIT, ID_TRAY_AUTOSTART,
+    ID_SPEED, ID_AUTOSTART, ID_TRAY_SHOW = 300, ID_TRAY_EXIT, ID_TRAY_AUTOSTART, ID_TRAY_CANCEL,
 };
-enum { WM_APP_STATUS = WM_APP + 1, WM_APP_PROGRESS, WM_APP_SENT, WM_APP_RECEIVED, WM_APP_TRAY, WM_APP_SHOW };
+enum { WM_APP_STATUS = WM_APP + 1, WM_APP_PROGRESS, WM_APP_SENT, WM_APP_RECEIVED, WM_APP_TRAY, WM_APP_SHOW, WM_APP_REFRESH };
 
 // ---------------------------------------------------------------- yardımcılar
 static std::string toUtf8(const std::wstring& w) {
@@ -106,6 +106,20 @@ static std::vector<uint32_t> g_peerList;    // listbox sırası
 static std::vector<std::wstring> g_peerNames;
 static std::vector<std::wstring> g_items;   // gönderilecekler
 static std::atomic<bool> g_busy{false};
+
+// ---- İptal: aktif aktarım soketleri; iptal edilince shutdown() ile kesilir
+static std::set<SOCKET> g_activeSocks, g_cancelledSocks;
+static void regSock(SOCKET s) { std::lock_guard<std::mutex> l(g_mx); g_activeSocks.insert(s); }
+static void unregSock(SOCKET s) {
+    { std::lock_guard<std::mutex> l(g_mx); g_activeSocks.erase(s); g_cancelledSocks.erase(s); }
+    PostMessageW(g_hwnd, WM_APP_REFRESH, 0, 0);
+}
+static bool isCancelled(SOCKET s) { std::lock_guard<std::mutex> l(g_mx); return g_cancelledSocks.count(s) > 0; }
+static bool anyTransfer() { std::lock_guard<std::mutex> l(g_mx); return !g_activeSocks.empty(); }
+static void cancelTransfers() {
+    std::lock_guard<std::mutex> l(g_mx);
+    for (SOCKET s : g_activeSocks) { g_cancelledSocks.insert(s); shutdown(s, SD_BOTH); }
+}
 
 static void postStatus(const std::wstring& s) {
     PostMessageW(g_hwnd, WM_APP_STATUS, 0, (LPARAM) new std::wstring(s));
@@ -375,8 +389,15 @@ static std::wstring uniqueName(const std::wstring& name) {
 }
 
 static void receiveThread(SOCKET s) {
-    struct Closer { SOCKET s; ~Closer() { closesocket(s); } } closer{s};
-    auto fail = [](const wchar_t* m) { postStatus(std::wstring(L"Alma hatası: ") + m); };
+    struct Closer { SOCKET s; ~Closer() { unregSock(s); closesocket(s); } } closer{s};
+    regSock(s);
+    std::wstring partial;
+    auto fail = [&](const wchar_t* m) {
+        if (!partial.empty()) DeleteFileW(partial.c_str());  // yarım dosyayı sil
+        if (isCancelled(s)) postStatus(L"Alma iptal edildi");
+        else postStatus(std::wstring(L"Alma hatası: ") + m);
+        PostMessageW(g_hwnd, WM_APP_SENT, 3, (LPARAM) nullptr);
+    };
 
     char magic[4];
     if (!recvExact(s, magic, 4) || memcmp(magic, MAGIC, 4) != 0) return;
@@ -422,6 +443,7 @@ static void receiveThread(SOCKET s) {
 
         HANDLE h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return fail((L"dosya oluşturulamadı: " + comps.back()).c_str());
+        partial = full;
         uint64_t rem = f.size;
         while (rem) {
             size_t n = (size_t)std::min<uint64_t>(CHUNK, rem);
@@ -431,6 +453,7 @@ static void receiveThread(SOCKET s) {
                 CloseHandle(h);
                 return fail(L"diske yazılamadı");
             }
+            if (isCancelled(s)) { CloseHandle(h); return fail(L"iptal"); }
             rem -= n; done += n;
             if (GetTickCount64() - lastUI > 100) {
                 lastUI = GetTickCount64();
@@ -438,6 +461,7 @@ static void receiveThread(SOCKET s) {
             }
         }
         CloseHandle(h);
+        partial.clear();
     }
     sendAll(s, "OK", 2);
     postProgress(total, total, rate.avg(total), false, L"");
@@ -482,8 +506,12 @@ static void walk(const std::wstring& dir, const std::wstring& rel, std::vector<S
 }
 
 static void sendThread(std::vector<std::wstring> items, uint32_t ip) {
+    SOCKET cur = INVALID_SOCKET;
     auto done = [&](bool ok, const std::wstring& msg) {
-        PostMessageW(g_hwnd, WM_APP_SENT, ok, (LPARAM) new std::wstring(msg));
+        if (!ok && cur != INVALID_SOCKET && isCancelled(cur))
+            PostMessageW(g_hwnd, WM_APP_SENT, 2, (LPARAM) new std::wstring(L"Gönderme iptal edildi"));
+        else
+            PostMessageW(g_hwnd, WM_APP_SENT, ok, (LPARAM) new std::wstring(msg));
     };
     std::vector<SendFile> files;
     for (auto& it : items) {
@@ -505,7 +533,9 @@ static void sendThread(std::vector<std::wstring> items, uint32_t ip) {
     postStatus(L"Bağlanıyor → " + ipStr(ip) + L"…");
     SOCKET s = connectTCP(ip, TRANSFER_PORT);
     if (s == INVALID_SOCKET) return done(false, L"Gönderme hatası: " + ipStr(ip) + L" adresine bağlanılamadı");
-    struct Closer { SOCKET s; ~Closer() { closesocket(s); } } closer{s};
+    struct Closer { SOCKET s; ~Closer() { unregSock(s); closesocket(s); } } closer{s};
+    cur = s;
+    regSock(s);
     if (!sendAll(s, hdr.data(), hdr.size())) return done(false, L"Gönderme hatası: bağlantı kesildi");
 
     std::vector<char> buf(CHUNK);
@@ -722,6 +752,7 @@ static void trayMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, ID_TRAY_SHOW, L"Göster");
     AppendMenuW(m, MF_STRING, ID_OPEN, L"Gelen Klasörü Aç");
+    if (anyTransfer()) AppendMenuW(m, MF_STRING, ID_TRAY_CANCEL, L"Aktarımı İptal Et");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (isAutoStart() ? MF_CHECKED : 0), ID_TRAY_AUTOSTART, L"Windows ile başla");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -815,8 +846,23 @@ static void pickItems(bool folders) {
     dlg->Release();
 }
 
+static bool g_cancelMode = false;
+// Aktarım sürerken Gönder düğmesi "İptal Et" düğmesine dönüşür
+static void refreshSendBtn() {
+    bool on = anyTransfer() || g_busy;
+    if (on == g_cancelMode) return;
+    g_cancelMode = on;
+    SetWindowTextW(g_send, on ? L"İptal Et" : L"Gönder");
+    EnableWindow(g_send, TRUE);
+    InvalidateRect(g_send, nullptr, FALSE);
+}
+
 static void doSend() {
-    if (g_busy) return;
+    if (g_cancelMode || g_busy) {
+        cancelTransfers();
+        SetWindowTextW(g_status, L"İptal ediliyor…");
+        return;
+    }
     wchar_t buf[64];
     GetWindowTextW(g_ip, buf, 64);
     std::wstring manual = buf;
@@ -836,9 +882,8 @@ static void doSend() {
     }
     if (g_items.empty()) { SetWindowTextW(g_status, L"Gönderilecek dosya yok — sürükleyip bırakın"); return; }
     g_busy = true;
-    SetWindowTextW(g_send, L"Gönderiliyor…");
-    EnableWindow(g_send, FALSE);
     resetStats();
+    refreshSendBtn();
     std::thread(sendThread, g_items, ip).detach();
 }
 
@@ -869,14 +914,17 @@ static void drawButton(DRAWITEMSTRUCT* d) {
         text(t, lr, TF_BODY, C_TEXT);
     } else if (id == ID_SEND) {
         fillRect(r, C_CARD);
-        COLORREF c = dis ? C_ACCENT_DIS : pr ? C_ACCENT_DK : hot ? C_ACCENT_HOT : C_ACCENT;
+        COLORREF base = g_cancelMode ? RGB(220, 38, 38) : C_ACCENT;
+        COLORREF c = dis ? C_ACCENT_DIS
+                   : g_cancelMode ? (pr ? RGB(185, 28, 28) : hot ? RGB(239, 68, 68) : base)
+                   : pr ? C_ACCENT_DK : hot ? C_ACCENT_HOT : C_ACCENT;
         if (!dis) {
             RECT sh = {rc.left + S(2), rc.top + S(4), rc.right - S(2), rc.bottom};
-            fillRound(sh, S(14), C_ACCENT, 0.18f);
+            fillRound(sh, S(14), base, 0.18f);
         }
         RECT b = {rc.left, rc.top, rc.right, rc.bottom - S(3)};
         fillRound(b, S(14), c);
-        text(dis ? std::wstring(t) : std::wstring(t) + L"   →", b, TF_H, C_WHITE, 1);
+        text(dis || g_cancelMode ? std::wstring(t) : std::wstring(t) + L"   →", b, TF_H, C_WHITE, 1);
     } else {
         fillRect(r, C_CARD);
         fillRound(r, S(9), pr ? C_PRESS : hot ? C_HOVER : C_CARD, 1, hot ? RGB(209, 213, 219) : C_BORDER);
@@ -1243,6 +1291,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_AUTOSTART:
         case ID_TRAY_AUTOSTART: setAutoStart(!isAutoStart()); break;
         case ID_TRAY_SHOW: showMain(); break;
+        case ID_TRAY_CANCEL: cancelTransfers(); SetWindowTextW(g_status, L"İptal ediliyor…"); break;
         case ID_TRAY_EXIT: DestroyWindow(hwnd); break;
         }
         return 0;
@@ -1257,6 +1306,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOW:
         showMain();
         return 0;
+    case WM_APP_REFRESH:
+        refreshSendBtn();
+        return 0;
     case WM_APP_STATUS: {
         auto s = (std::wstring*)lp;
         SetWindowTextW(g_status, s->c_str());
@@ -1264,6 +1316,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_APP_PROGRESS: {
+        refreshSendBtn();
         auto p = (Prog*)lp;
         int pm = p->total ? (int)(p->done * 1000 / p->total) : 1000;
         setProg(pm);
@@ -1283,12 +1336,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_SENT: {
         auto s = (std::wstring*)lp;
+        if (wp == 3) {  // alma başarısız / iptal
+            resetStats();
+            trayTip(L"LAN Transfer");
+            refreshSendBtn();
+            return 0;
+        }
         g_busy = false;
-        SetWindowTextW(g_send, L"Gönder");
-        EnableWindow(g_send, TRUE);
+        refreshSendBtn();
         SetWindowTextW(g_status, s->c_str());
         trayTip(L"LAN Transfer");
-        if (wp) {
+        if (wp == 2) {  // iptal edildi
+            resetStats();
+        } else if (wp) {
             clearQueue();
             if (!IsWindowVisible(hwnd)) trayBalloon(L"Gönderim tamamlandı", *s);
         } else {

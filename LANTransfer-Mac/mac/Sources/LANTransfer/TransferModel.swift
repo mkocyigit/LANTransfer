@@ -28,6 +28,31 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
     private var seen: [String: (name: String, time: Date)] = [:]
     private var ownIPs = Set<UInt32>()
     private var started = false
+    private var activeSocks = Set<Int32>()
+    private var cancelledSocks = Set<Int32>()
+
+    // MARK: İptal
+
+    private func register(_ s: Sock) { lock.lock(); activeSocks.insert(s.fd); lock.unlock() }
+    private func unregister(_ s: Sock) {
+        lock.lock(); activeSocks.remove(s.fd); cancelledSocks.remove(s.fd); lock.unlock()
+    }
+    private func isCancelled(_ s: Sock) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelledSocks.contains(s.fd)
+    }
+
+    /// Süren tüm gönderme/alma işlemlerini iptal eder (soketleri kapatarak).
+    func cancel() {
+        lock.lock()
+        for fd in activeSocks {
+            cancelledSocks.insert(fd)
+            shutdown(fd, SHUT_RDWR)
+        }
+        let any = !activeSocks.isEmpty
+        lock.unlock()
+        if any { status = "İptal ediliyor…" }
+    }
 
     private func ui(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
 
@@ -195,6 +220,9 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
     }
 
     private func receive(_ s: Sock) {
+        register(s)
+        defer { unregister(s) }
+        var partial: URL?
         do {
             guard let m = s.recvExact(4), Array(m) == Proto.magic else { return }
             let sender = try s.readString()
@@ -222,6 +250,7 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
                 guard fm.createFile(atPath: dest.path, contents: nil) else {
                     throw TransferError("Dosya oluşturulamadı: \(dest.lastPathComponent)")
                 }
+                partial = dest
                 let fh = try FileHandle(forWritingTo: dest)
                 defer { try? fh.close() }
                 var rem = f.size
@@ -239,6 +268,7 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
                         ui { self.active = true; self.progress = p; self.detail = txt; self.status = "Alınıyor ← \(sender): \(name)" }
                     }
                 }
+                partial = nil
             }
             _ = s.sendAll(Data("OK".utf8))
             ui {
@@ -250,7 +280,10 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
                 NSApp.requestUserAttention(.informationalRequest)
             }
         } catch {
-            ui { self.active = false; self.detail = ""; self.status = "Alma hatası: \(error)" }
+            // Yarım kalan dosyayı sil
+            if let partial { try? FileManager.default.removeItem(at: partial) }
+            let msg = isCancelled(s) ? "Alma iptal edildi" : "Alma hatası: \(error)"
+            ui { self.active = false; self.progress = 0; self.detail = ""; self.status = msg }
         }
     }
 
@@ -296,6 +329,8 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
     }
 
     private func sendFiles(_ items: [URL], _ ip: UInt32) {
+        var sock: Sock?
+        defer { if let sock { unregister(sock) } }
         do {
             let files = collect(items)
             guard !files.isEmpty else { throw TransferError("Gönderilecek dosya bulunamadı") }
@@ -309,6 +344,8 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
             guard let s = connectTCP(ip, Proto.transferPort) else {
                 throw TransferError("\(ipString(ip)) adresine bağlanılamadı")
             }
+            sock = s
+            register(s)
             guard s.sendAll(hdr) else { throw TransferError("Bağlantı kesildi") }
 
             var done: UInt64 = 0
@@ -345,7 +382,8 @@ final class TransferModel: ObservableObject, @unchecked Sendable {
                 self.status = "\(files.count) dosya gönderildi ✓"
             }
         } catch {
-            ui { self.busy = false; self.active = false; self.detail = ""; self.status = "Gönderme hatası: \(error)" }
+            let msg = sock.map(isCancelled) == true ? "Gönderme iptal edildi" : "Gönderme hatası: \(error)"
+            ui { self.busy = false; self.active = false; self.progress = 0; self.detail = ""; self.status = msg }
         }
     }
 }

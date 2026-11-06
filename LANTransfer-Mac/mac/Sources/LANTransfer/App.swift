@@ -75,6 +75,9 @@ struct TrayMenu: View {
     var body: some View {
         Text(m.status)
         if !m.detail.isEmpty { Text(m.detail) }
+        if m.active || m.busy {
+            Button("Aktarımı İptal Et") { m.cancel() }
+        }
         Divider()
         Button("LAN Transfer'i Göster") {
             openWindow(id: "main")
@@ -255,6 +258,14 @@ struct ContentView: View {
                 Text(m.detail.isEmpty ? " " : m.detail)
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if m.active || m.busy {
+                Button(role: .cancel) { m.cancel() } label: {
+                    Label("İptal", systemImage: "xmark.circle.fill")
+                        .padding(.vertical, 4)
+                }
+                .controlSize(.large)
+                .keyboardShortcut(.cancelAction)
             }
             Button { m.send() } label: {
                 HStack(spacing: 8) {
